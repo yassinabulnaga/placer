@@ -550,6 +550,145 @@ class PartitionSeededPortfolioPlacer:
                             "dreamplace_white_polish": polish,
                         }
                     )
+        # Multi-seed DREAMPlace ensemble.
+        # Three configs (balanced / dense_sharp / loose) x four random seeds.
+        # The current production winner is single-seed dreamplace_full_outline_balanced_white_local_soft;
+        # we add 12 sibling variants that differ only in (random_seed, gp_noise_ratio) and apply
+        # the same whitespace soft polish. Top-2 by exact proxy will be chosen by the existing
+        # shortlist logic (see _exact_score loop below), so the cost of losing seeds is bounded.
+        if os.environ.get("PARTCL_ENABLE_DREAMPLACE_ENSEMBLE", "1") != "0":
+            ensemble_base_cfg = {
+                "return_all_macros": 1,
+                "macro_place_flag": 0,
+                "single_stage": 1,
+                "enable_fillers": 0,
+                "omit_soft_macros": 0,
+                "use_bb": 1,
+                "num_bins_scale": 0.75,
+                "stage1_bins_scale": 1.0,
+                "stage1_iter_scale": 18,
+                "stop_overflow": 0.08,
+                "adjust_rudy_area_flag": 0,
+                "adjust_pin_area_flag": 0,
+                "max_num_area_adjust": 0,
+                "random_center_init_flag": 0,
+                "steps": 26 if complexity <= 320 else 24,
+            }
+            ensemble_cfg_variants = (
+                (
+                    "balanced",
+                    {
+                        "target_density": 0.84,
+                        "density_weight": 2.8e-5,
+                        "gamma": 5.2,
+                        "lr": 0.0065,
+                    },
+                ),
+                (
+                    "dense_sharp",
+                    {
+                        "target_density": 0.90,
+                        "density_weight": 3.2e-5,
+                        "gamma": 5.6,
+                        "lr": 0.006,
+                    },
+                ),
+                (
+                    "loose",
+                    {
+                        "target_density": 0.78,
+                        "density_weight": 3.8e-5,
+                        "gamma": 5.4,
+                        "lr": 0.006,
+                    },
+                ),
+            )
+            # Four well-spread seeds. Hash benchmark.name in too so different benchmarks
+            # don't accidentally share an identical full search basin.
+            name_salt = sum(ord(ch) for ch in benchmark.name) * 7919
+            ensemble_seeds = (
+                (1000 + name_salt + 0, 0.005),
+                (1000 + name_salt + 7919, 0.010),
+                (1000 + name_salt + 15737, 0.018),
+                (1000 + name_salt + 24593, 0.012),
+            )
+            ensemble_polish_cfg = {
+                "limit": 16,
+                "region_rows": 6,
+                "region_cols": 6,
+                "anchor_weight": 0.060,
+                "relax": 0.76,
+                "solver_steps": 12,
+                "max_disp_frac": 0.008,
+                "step_scale": 0.20,
+            }
+            for cfg_label, cfg_overrides in ensemble_cfg_variants:
+                for seed_idx, (random_seed, gp_noise) in enumerate(ensemble_seeds):
+                    variant_cfg = {
+                        **ensemble_base_cfg,
+                        **cfg_overrides,
+                        "random_seed": int(random_seed),
+                        "gp_noise_ratio": float(gp_noise),
+                    }
+                    candidate_specs.append(
+                        {
+                            "name": f"dreamplace_ensemble_{cfg_label}_s{seed_idx}",
+                            "dreamplace_full_placement": True,
+                            "seed": self._legalize_hard_numpy(outline_hard.copy(), benchmark),
+                            "base_placement": outline_placement.clone(),
+                            "cfg": variant_cfg,
+                            "dreamplace_white_polish": True,
+                            "dreamplace_white_polish_cfg": dict(ensemble_polish_cfg),
+                        }
+                    )
+
+        # RUDY-based congestion refiner.
+        # Standalone candidate (cheap, runs from outline_legal) + RUDY-polished
+        # sibling of the current production winner. Both gated on/off via env.
+        if os.environ.get("PARTCL_ENABLE_RUDY", "1") != "0":
+            candidate_specs.append(
+                {
+                    "name": "outline_rudy_refine",
+                    "direct_placement": True,
+                    "rudy_refine": True,
+                    "rudy_refine_rounds": 2,
+                    "placement": outline_placement.clone(),
+                }
+            )
+            if os.environ.get("PARTCL_ENABLE_DREAMPLACE_BASIN", "1") != "0":
+                rudy_polish_cfg = {
+                    **dreamplace_full_base_cfg,
+                    "target_density": 0.84,
+                    "density_weight": 2.8e-5,
+                    "gamma": 5.2,
+                    "lr": 0.0065,
+                    "num_bins_scale": 0.75,
+                    "stop_overflow": 0.08,
+                }
+                rudy_white_cfg = {
+                    "limit": 16,
+                    "region_rows": 6,
+                    "region_cols": 6,
+                    "anchor_weight": 0.060,
+                    "relax": 0.76,
+                    "solver_steps": 12,
+                    "max_disp_frac": 0.008,
+                    "step_scale": 0.20,
+                }
+                candidate_specs.append(
+                    {
+                        "name": "dreamplace_full_outline_balanced_white_local_soft_rudy",
+                        "dreamplace_full_placement": True,
+                        "seed": self._legalize_hard_numpy(outline_hard.copy(), benchmark),
+                        "base_placement": outline_placement.clone(),
+                        "cfg": rudy_polish_cfg.copy(),
+                        "dreamplace_white_polish": True,
+                        "dreamplace_white_polish_cfg": rudy_white_cfg,
+                        "dreamplace_rudy_polish": True,
+                        "dreamplace_rudy_polish_rounds": 2,
+                    }
+                )
+
         candidate_specs.append(
             {
                 "name": "outline_softopt_torch",
@@ -611,6 +750,20 @@ class PartitionSeededPortfolioPlacer:
                     "dreamplace_full_balanced_random_white",
                 },
                 "outline_only": {"outline_legal"},
+                "ensemble": (
+                    {"outline_legal", "dreamplace_full_outline_balanced_white_local_soft"}
+                    | {
+                        f"dreamplace_ensemble_{cfg_label}_s{seed_idx}"
+                        for cfg_label in ("balanced", "dense_sharp", "loose")
+                        for seed_idx in range(4)
+                    }
+                ),
+                "rudy": {
+                    "outline_legal",
+                    "outline_rudy_refine",
+                    "dreamplace_full_outline_balanced_white_local_soft",
+                    "dreamplace_full_outline_balanced_white_local_soft_rudy",
+                },
             }.get(profile_mode)
             if allowed_names is not None:
                 candidate_specs = [spec for spec in candidate_specs if spec["name"] in allowed_names]
@@ -1323,6 +1476,20 @@ class PartitionSeededPortfolioPlacer:
                     "dreamplace_full_balanced_random_white",
                 },
                 "outline_only": {"outline_legal"},
+                "ensemble": (
+                    {"outline_legal", "dreamplace_full_outline_balanced_white_local_soft"}
+                    | {
+                        f"dreamplace_ensemble_{cfg_label}_s{seed_idx}"
+                        for cfg_label in ("balanced", "dense_sharp", "loose")
+                        for seed_idx in range(4)
+                    }
+                ),
+                "rudy": {
+                    "outline_legal",
+                    "outline_rudy_refine",
+                    "dreamplace_full_outline_balanced_white_local_soft",
+                    "dreamplace_full_outline_balanced_white_local_soft_rudy",
+                },
             }.get(profile_mode)
             if allowed_names is not None:
                 candidate_specs = [spec for spec in candidate_specs if spec["name"] in allowed_names]
@@ -1403,6 +1570,18 @@ class PartitionSeededPortfolioPlacer:
                         graph=graph,
                         plc=plc,
                     )
+                if spec.get("dreamplace_rudy_polish") and plc is not None:
+                    rudy_rounds = int(spec.get("dreamplace_rudy_polish_rounds", 1))
+                    for _ in range(max(1, rudy_rounds)):
+                        new_placement = self._outline_rudy_refine(
+                            placement=placement,
+                            benchmark=benchmark,
+                            graph=graph,
+                            plc=plc,
+                        )
+                        if new_placement is placement:
+                            break
+                        placement = new_placement
             elif spec.get("direct_placement"):
                 refine_backend = "baseline"
                 if spec["name"] == "outline_legal":
@@ -1455,6 +1634,20 @@ class PartitionSeededPortfolioPlacer:
                         graph=graph,
                         plc=plc,
                     )
+                elif spec.get("rudy_refine"):
+                    seed_placement = spec.get("placement", outline_placement).clone()
+                    rudy_rounds = int(spec.get("rudy_refine_rounds", 2))
+                    placement = seed_placement
+                    for _ in range(max(1, rudy_rounds)):
+                        new_placement = self._outline_rudy_refine(
+                            placement=placement,
+                            benchmark=benchmark,
+                            graph=graph,
+                            plc=plc,
+                        )
+                        if new_placement is placement:
+                            break
+                        placement = new_placement
                 elif spec.get("soft_search_refine"):
                     placement = self._macrobase_soft_search(
                         placement=spec.get("placement", outline_placement).clone(),
@@ -6401,6 +6594,247 @@ class PartitionSeededPortfolioPlacer:
         base_penalty = float(np.linalg.norm(new_center - base_pos[idx]) / max(canvas_scale, 1.0e-9))
         bary_penalty = float(np.linalg.norm(new_center - bary[idx]) / max(canvas_scale, 1.0e-9))
         return 2.4 * congestion_relief - 3.2 * crowd_penalty - 0.9 * base_penalty - 0.35 * bary_penalty
+
+    def _compute_rudy_map(
+        self,
+        placement: torch.Tensor,
+        benchmark: Benchmark,
+    ) -> np.ndarray:
+        """Per-net pin-bbox RUDY demand on the contest grid.
+
+        Each net contributes weight / max(bbox_w, eps) horizontally and
+        weight / max(bbox_h, eps) vertically, smeared uniformly over the
+        bounding box's grid cells. Returns the L2-combined demand.
+        """
+        nrow = max(int(benchmark.grid_rows), 1)
+        ncol = max(int(benchmark.grid_cols), 1)
+        cell_w = float(benchmark.canvas_width) / ncol
+        cell_h = float(benchmark.canvas_height) / nrow
+        pos = placement.cpu().numpy().astype(np.float64)
+        port_pos = benchmark.port_positions.cpu().numpy().astype(np.float64)
+        port_start = benchmark.num_macros
+        h_demand = np.zeros((nrow, ncol), dtype=np.float64)
+        v_demand = np.zeros((nrow, ncol), dtype=np.float64)
+        for net_idx, nodes in enumerate(benchmark.net_nodes):
+            if len(nodes) < 2:
+                continue
+            xs = []
+            ys = []
+            for node in nodes.tolist():
+                if node < benchmark.num_macros:
+                    xs.append(pos[node, 0])
+                    ys.append(pos[node, 1])
+                else:
+                    pidx = node - port_start
+                    if 0 <= pidx < port_pos.shape[0]:
+                        xs.append(port_pos[pidx, 0])
+                        ys.append(port_pos[pidx, 1])
+            if len(xs) < 2:
+                continue
+            xmin = max(0.0, min(xs))
+            xmax = max(xmin, max(xs))
+            ymin = max(0.0, min(ys))
+            ymax = max(ymin, max(ys))
+            c0 = min(ncol - 1, max(0, int(xmin / max(cell_w, 1.0e-9))))
+            c1 = min(ncol - 1, max(0, int(xmax / max(cell_w, 1.0e-9))))
+            r0 = min(nrow - 1, max(0, int(ymin / max(cell_h, 1.0e-9))))
+            r1 = min(nrow - 1, max(0, int(ymax / max(cell_h, 1.0e-9))))
+            weight = (
+                float(benchmark.net_weights[net_idx].item())
+                if net_idx < len(benchmark.net_weights)
+                else 1.0
+            )
+            bbox_w = max(xmax - xmin, cell_w * 0.25)
+            bbox_h = max(ymax - ymin, cell_h * 0.25)
+            h_per_cell = weight / bbox_w
+            v_per_cell = weight / bbox_h
+            h_demand[r0 : r1 + 1, c0 : c1 + 1] += h_per_cell
+            v_demand[r0 : r1 + 1, c0 : c1 + 1] += v_per_cell
+        return np.sqrt(h_demand * h_demand + v_demand * v_demand)
+
+    def _outline_rudy_refine(
+        self,
+        placement: torch.Tensor,
+        benchmark: Benchmark,
+        graph: dict,
+        plc,
+    ) -> torch.Tensor:
+        """Push hard and soft macros away from top-5% RUDY hotspots.
+
+        Accept-only-if-better at the exact proxy. Combines a small hard-macro
+        shift with a soft Laplacian re-solve.
+        """
+        if plc is None:
+            return placement
+
+        rudy = self._compute_rudy_map(placement, benchmark)
+        if not np.isfinite(rudy).all() or float(rudy.max()) < 1.0e-9:
+            return placement
+
+        nrow, ncol = rudy.shape
+        threshold = float(np.percentile(rudy, 95.0))
+        hot_mask = rudy >= threshold
+        hot_count = int(np.count_nonzero(hot_mask))
+        if hot_count == 0:
+            return placement
+
+        # Smooth gradient field: descent direction = -∇RUDY (repel from hotspots).
+        # Use central differences with a small Gaussian smoothing to avoid bin noise.
+        smoothed = rudy.copy()
+        if min(nrow, ncol) >= 4:
+            kernel = np.array([0.25, 0.5, 0.25], dtype=np.float64)
+            smoothed = np.apply_along_axis(
+                lambda a: np.convolve(a, kernel, mode="same"), 0, smoothed
+            )
+            smoothed = np.apply_along_axis(
+                lambda a: np.convolve(a, kernel, mode="same"), 1, smoothed
+            )
+        gy = np.zeros_like(smoothed)
+        gx = np.zeros_like(smoothed)
+        gy[1:-1, :] = 0.5 * (smoothed[2:, :] - smoothed[:-2, :])
+        gx[:, 1:-1] = 0.5 * (smoothed[:, 2:] - smoothed[:, :-2])
+        rudy_max = float(smoothed.max() + 1.0e-9)
+
+        cell_w = float(benchmark.canvas_width) / ncol
+        cell_h = float(benchmark.canvas_height) / nrow
+        canvas_scale = max(float(benchmark.canvas_width), float(benchmark.canvas_height))
+
+        num_hard = int(benchmark.num_hard_macros)
+        num_soft = int(benchmark.num_soft_macros)
+        widths = benchmark.macro_sizes[:num_hard, 0].cpu().numpy().astype(np.float64)
+        heights = benchmark.macro_sizes[:num_hard, 1].cpu().numpy().astype(np.float64)
+        movable_hard = (~benchmark.macro_fixed[:num_hard]).cpu().numpy()
+        max_hard_disp = 0.012 * canvas_scale
+        max_soft_disp_frac = 0.010
+
+        current = placement.clone()
+        current_costs = self._exact_costs(current, benchmark, plc)
+        baseline_proxy = float(current_costs["proxy_cost"])
+        baseline_dc = float(current_costs["density_cost"] + current_costs["congestion_cost"])
+
+        # Score hard macros by RUDY exposure within their bbox, push the worst K.
+        hard_exposure = np.zeros(num_hard, dtype=np.float64)
+        push_dir = np.zeros((num_hard, 2), dtype=np.float64)
+        pos_arr = current[:num_hard].cpu().numpy().astype(np.float64)
+        for idx in range(num_hard):
+            if not movable_hard[idx]:
+                continue
+            x = pos_arr[idx, 0]
+            y = pos_arr[idx, 1]
+            hw = widths[idx] * 0.5
+            hh = heights[idx] * 0.5
+            c0 = min(ncol - 1, max(0, int((x - hw) / max(cell_w, 1.0e-9))))
+            c1 = min(ncol - 1, max(0, int((x + hw) / max(cell_w, 1.0e-9))))
+            r0 = min(nrow - 1, max(0, int((y - hh) / max(cell_h, 1.0e-9))))
+            r1 = min(nrow - 1, max(0, int((y + hh) / max(cell_h, 1.0e-9))))
+            patch = smoothed[r0 : r1 + 1, c0 : c1 + 1]
+            patch_hot = hot_mask[r0 : r1 + 1, c0 : c1 + 1]
+            hard_exposure[idx] = float(patch.mean()) * (1.0 + 0.5 * float(patch_hot.mean()))
+            gx_local = float(np.mean(gx[r0 : r1 + 1, c0 : c1 + 1]))
+            gy_local = float(np.mean(gy[r0 : r1 + 1, c0 : c1 + 1]))
+            norm = max(np.hypot(gx_local, gy_local), 1.0e-9)
+            push_dir[idx, 0] = -gx_local / norm
+            push_dir[idx, 1] = -gy_local / norm
+
+        top_k = 12 if num_hard <= 320 else 8 if num_hard <= 430 else 6
+        order = np.argsort(-hard_exposure)
+        active = [int(i) for i in order if hard_exposure[i] > 0.0][:top_k]
+        if not active:
+            return current
+
+        # Try a step ladder. The first improvement wins.
+        for step_frac in (0.012, 0.008, 0.005):
+            trial_hard = pos_arr.copy()
+            step = step_frac * canvas_scale
+            for idx in active:
+                trial_hard[idx, 0] += push_dir[idx, 0] * step
+                trial_hard[idx, 1] += push_dir[idx, 1] * step
+            trial_hard[:, 0] = np.clip(
+                trial_hard[:, 0], widths * 0.5, benchmark.canvas_width - widths * 0.5
+            )
+            trial_hard[:, 1] = np.clip(
+                trial_hard[:, 1], heights * 0.5, benchmark.canvas_height - heights * 0.5
+            )
+            trial_hard = self._legalize_hard_numpy(trial_hard, benchmark)
+            disp = trial_hard - pos_arr
+            if float(np.linalg.norm(disp, axis=1).max()) > max_hard_disp * 1.5:
+                continue
+
+            trial = current.clone()
+            trial[:num_hard] = torch.tensor(trial_hard, dtype=trial.dtype)
+
+            if num_soft > 0:
+                anchor_pos = current[num_hard:].cpu().numpy().astype(np.float64)
+                trial = self._quadratic_soft_macro_follow(
+                    placement=trial,
+                    benchmark=benchmark,
+                    graph=graph,
+                    anchor_weight=0.050,
+                    relax=0.74,
+                    solver_steps=14,
+                    anchor_pos=anchor_pos,
+                )
+                # Soft RUDY push: nudge soft macros sitting in hot bins toward
+                # the smoothed gradient direction, capped tightly.
+                soft = trial[num_hard:].cpu().numpy().astype(np.float64)
+                soft_widths = (
+                    benchmark.macro_sizes[num_hard:, 0].cpu().numpy().astype(np.float64)
+                )
+                soft_heights = (
+                    benchmark.macro_sizes[num_hard:, 1].cpu().numpy().astype(np.float64)
+                )
+                fixed_soft = benchmark.macro_fixed[num_hard:].cpu().numpy()
+                max_soft = max_soft_disp_frac * canvas_scale
+                for s_idx in range(num_soft):
+                    if fixed_soft[s_idx]:
+                        continue
+                    sx = soft[s_idx, 0]
+                    sy = soft[s_idx, 1]
+                    c = min(ncol - 1, max(0, int(sx / max(cell_w, 1.0e-9))))
+                    r = min(nrow - 1, max(0, int(sy / max(cell_h, 1.0e-9))))
+                    if not hot_mask[r, c]:
+                        continue
+                    dx = -float(gx[r, c])
+                    dy = -float(gy[r, c])
+                    norm = max(np.hypot(dx, dy), 1.0e-9)
+                    dx /= norm
+                    dy /= norm
+                    soft[s_idx, 0] += dx * 0.35 * max_soft
+                    soft[s_idx, 1] += dy * 0.35 * max_soft
+                soft[:, 0] = np.clip(
+                    soft[:, 0],
+                    soft_widths * 0.5,
+                    benchmark.canvas_width - soft_widths * 0.5,
+                )
+                soft[:, 1] = np.clip(
+                    soft[:, 1],
+                    soft_heights * 0.5,
+                    benchmark.canvas_height - soft_heights * 0.5,
+                )
+                trial[num_hard:] = torch.tensor(soft, dtype=trial.dtype)
+
+            trial_costs = self._exact_costs(trial, benchmark, plc)
+            trial_proxy = float(trial_costs["proxy_cost"])
+            trial_dc = float(trial_costs["density_cost"] + trial_costs["congestion_cost"])
+            if int(trial_costs.get("overlap_count", 0)) != 0:
+                continue
+            proxy_gain = baseline_proxy - trial_proxy
+            dc_gain = baseline_dc - trial_dc
+            accept = (
+                proxy_gain >= 1.0e-4
+                or (dc_gain >= 0.02 and trial_proxy <= baseline_proxy + 0.005)
+            )
+            if accept:
+                if os.environ.get("PARTCL_DEBUG_RUDY", "0") == "1":
+                    print(
+                        f"[partcl:rudy] {benchmark.name} "
+                        f"step={step_frac:.3f} hot={hot_count} active={len(active)} "
+                        f"proxy {baseline_proxy:.4f}->{trial_proxy:.4f} "
+                        f"dc {baseline_dc:.4f}->{trial_dc:.4f}"
+                    )
+                return trial
+
+        return current
 
     def _outline_route_refine(
         self,

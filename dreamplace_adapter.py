@@ -260,12 +260,62 @@ def _export_design(benchmark, plc, seed: np.ndarray, design_dir: Path, config: d
 
     die_width_db = max(_db(benchmark.canvas_width), 1)
     die_height_db = max(_db(benchmark.canvas_height), 1)
-    site_width_db = max(die_width_db // max(benchmark.grid_cols, 1), 1)
-    row_height_db = max(die_height_db // max(benchmark.grid_rows, 1), 1)
+    # Use a std-cell-pitch site/row grid rather than the coarse contest-grid pitch.
+    # DREAMPlace's electrostatic spreading and legalizer assume sites much finer
+    # than macros; one grid-cell-per-site under-resolves spreading by ~4-16x for
+    # typical IBM benchmark macro sizes.
+    cfg = config or {}
+    # Env override lets us regress to the legacy coarse-grid export without
+    # threading a config flag through every call site.
+    if os.environ.get("PARTCL_DREAMPLACE_FINE_SITE", "1") == "0":
+        fine_site_grid = False
+    else:
+        fine_site_grid = bool(int(cfg.get("fine_site_grid", 1)))
+    if fine_site_grid:
+        try:
+            sizes = benchmark.macro_sizes.cpu().numpy().astype(float)
+            num_macros = int(benchmark.num_macros)
+            min_w = float(sizes[:num_macros, 0].min()) if num_macros > 0 else 0.0
+            min_h = float(sizes[:num_macros, 1].min()) if num_macros > 0 else 0.0
+        except Exception:
+            min_w = 0.0
+            min_h = 0.0
+        canvas_w = float(benchmark.canvas_width)
+        canvas_h = float(benchmark.canvas_height)
+        coarse_site_w = canvas_w / max(benchmark.grid_cols, 1)
+        coarse_row_h = canvas_h / max(benchmark.grid_rows, 1)
+        # Target site/row at least 4x finer than the smallest macro, but bounded
+        # so we do not blow up LEF/DEF size: at most ~2048 sites across the die.
+        target_site_w = max(min_w * 0.25, canvas_w / 2048.0)
+        target_row_h = max(min_h * 0.25, canvas_h / 2048.0)
+        # Never coarser than the previous contest-grid pitch (regression safety).
+        target_site_w = min(target_site_w, coarse_site_w)
+        target_row_h = min(target_row_h, coarse_row_h)
+        # Avoid pathological values.
+        target_site_w = max(target_site_w, canvas_w / 4096.0)
+        target_row_h = max(target_row_h, canvas_h / 4096.0)
+        site_width_db = max(_db(target_site_w), 1)
+        row_height_db = max(_db(target_row_h), 1)
+    else:
+        site_width_db = max(die_width_db // max(benchmark.grid_cols, 1), 1)
+        row_height_db = max(die_height_db // max(benchmark.grid_rows, 1), 1)
     site_width = site_width_db / DB_UNITS
     row_height = row_height_db / DB_UNITS
 
-    _write_tech_lef(tech_lef, site_width=site_width, row_height=row_height)
+    env_layers = os.environ.get("PARTCL_DREAMPLACE_LAYERS")
+    if env_layers is not None and env_layers.strip():
+        try:
+            num_routing_layers = max(1, int(env_layers))
+        except ValueError:
+            num_routing_layers = max(1, int((config or {}).get("num_routing_layers", 4)))
+    else:
+        num_routing_layers = max(1, int((config or {}).get("num_routing_layers", 4)))
+    _write_tech_lef(
+        tech_lef,
+        site_width=site_width,
+        row_height=row_height,
+        num_routing_layers=num_routing_layers,
+    )
     _write_cells_lef(cells_lef, instances)
     _write_def(
         init_def,
@@ -284,6 +334,7 @@ def _export_design(benchmark, plc, seed: np.ndarray, design_dir: Path, config: d
         "instances": instances,
         "site_width_db": site_width_db,
         "row_height_db": row_height_db,
+        "num_routing_layers": num_routing_layers,
     }
 
 
@@ -432,26 +483,44 @@ def _match_pin_name(pin_defs: Dict[str, dict], pin_orig: str) -> str:
     return next(iter(pin_defs))
 
 
-def _write_tech_lef(path: Path, site_width: float, row_height: float) -> None:
-    content = f"""VERSION 5.8 ;
-BUSBITCHARS "[]" ;
-DIVIDERCHAR "/" ;
-UNITS
-  DATABASE MICRONS 2000 ;
-END UNITS
-MANUFACTURINGGRID 0.001 ;
-LAYER metal1
-  TYPE ROUTING ;
-  DIRECTION HORIZONTAL ;
-  PITCH 0.2 ;
-  WIDTH 0.1 ;
-END metal1
-SITE CORE
-  CLASS CORE ;
-  SIZE {site_width:.6f} BY {row_height:.6f} ;
-END CORE
-END LIBRARY
-"""
+def _write_tech_lef(path: Path, site_width: float, row_height: float, num_routing_layers: int = 4) -> None:
+    """Tech LEF with multiple alternating routing layers.
+
+    Direction alternates HORIZONTAL/VERTICAL; pitch is set to a fraction of
+    site_width so the layer count is meaningful relative to the placement grid.
+    DREAMPlace's routability optimization indexes per-layer capacities, so a
+    single-layer LEF (the prior behavior) starves the routability gradient.
+    """
+    num_routing_layers = max(1, int(num_routing_layers))
+    pitch = max(site_width * 0.5, 0.05)
+    width = max(pitch * 0.5, 0.025)
+    layers = []
+    for layer_idx in range(num_routing_layers):
+        direction = "HORIZONTAL" if layer_idx % 2 == 0 else "VERTICAL"
+        layers.append(
+            f"LAYER metal{layer_idx + 1}\n"
+            f"  TYPE ROUTING ;\n"
+            f"  DIRECTION {direction} ;\n"
+            f"  PITCH {pitch:.6f} ;\n"
+            f"  WIDTH {width:.6f} ;\n"
+            f"END metal{layer_idx + 1}"
+        )
+    layers_block = "\n".join(layers)
+    content = (
+        f"VERSION 5.8 ;\n"
+        f"BUSBITCHARS \"[]\" ;\n"
+        f"DIVIDERCHAR \"/\" ;\n"
+        f"UNITS\n"
+        f"  DATABASE MICRONS 2000 ;\n"
+        f"END UNITS\n"
+        f"MANUFACTURINGGRID 0.001 ;\n"
+        f"{layers_block}\n"
+        f"SITE CORE\n"
+        f"  CLASS CORE ;\n"
+        f"  SIZE {site_width:.6f} BY {row_height:.6f} ;\n"
+        f"END CORE\n"
+        f"END LIBRARY\n"
+    )
     path.write_text(content, encoding="utf-8")
 
 
@@ -519,11 +588,22 @@ def _write_def(
         f"UNITS DISTANCE MICRONS {DB_UNITS} ;",
         f"DIEAREA ( 0 0 ) ( {_db(benchmark.canvas_width)} {_db(benchmark.canvas_height)} ) ;",
     ]
-    for row in range(max(benchmark.grid_rows, 1)):
+    die_width_db = _db(benchmark.canvas_width)
+    die_height_db = _db(benchmark.canvas_height)
+    sites_per_row = max(1, die_width_db // max(site_width_db, 1))
+    num_rows = max(1, die_height_db // max(row_height_db, 1))
+    # Cap row count at 2048 so DEF size stays manageable on large benchmarks.
+    if num_rows > 2048:
+        num_rows = 2048
+        row_height_db = max(1, die_height_db // num_rows)
+    if sites_per_row > 4096:
+        sites_per_row = 4096
+        site_width_db = max(1, die_width_db // sites_per_row)
+    for row in range(num_rows):
         y_db = row * row_height_db
         orient = "N" if row % 2 == 0 else "FS"
         lines.append(
-            f"ROW ROW_{row} CORE 0 {y_db} {orient} DO {max(benchmark.grid_cols, 1)} BY 1 STEP {site_width_db} 0 ;"
+            f"ROW ROW_{row} CORE 0 {y_db} {orient} DO {sites_per_row} BY 1 STEP {site_width_db} 0 ;"
         )
 
     lines.append(f"COMPONENTS {len(instances)} ;")
@@ -661,7 +741,7 @@ def _write_params_json(benchmark, config: dict, exported: Dict[str, object], par
         "target_density": target_density,
         "density_weight": float(config.get("density_weight", 8.0e-5)),
         "gamma": float(config.get("gamma", 4.0)),
-        "random_seed": 1000 + sum(ord(ch) for ch in benchmark.name),
+        "random_seed": int(config.get("random_seed", 1000 + sum(ord(ch) for ch in benchmark.name))),
         "scale_factor": 1.0,
         "ignore_net_degree": 100,
         "enable_fillers": int(config.get("enable_fillers", 1)),
@@ -694,8 +774,22 @@ def _write_params_json(benchmark, config: dict, exported: Dict[str, object], par
         "route_area_adjust_stop_ratio": float(config.get("route_area_adjust_stop_ratio", 0.01)),
         "pin_area_adjust_stop_ratio": float(config.get("pin_area_adjust_stop_ratio", 0.05)),
         "node_area_adjust_overflow": float(config.get("node_area_adjust_overflow", 0.12)),
-        "unit_horizontal_capacity": float(config.get("unit_horizontal_capacity", benchmark.hroutes_per_micron)),
-        "unit_vertical_capacity": float(config.get("unit_vertical_capacity", benchmark.vroutes_per_micron)),
+        # With a multi-layer tech LEF, DREAMPlace builds one capacity array per
+        # routing layer. Split the total per-direction capacity across the
+        # available H/V layers so the integral is preserved while routability
+        # gradients have meaningful per-layer headroom to allocate.
+        "unit_horizontal_capacity": float(
+            config.get(
+                "unit_horizontal_capacity",
+                float(benchmark.hroutes_per_micron) / max(1, (exported["num_routing_layers"] + 1) // 2),
+            )
+        ),
+        "unit_vertical_capacity": float(
+            config.get(
+                "unit_vertical_capacity",
+                float(benchmark.vroutes_per_micron) / max(1, exported["num_routing_layers"] // 2),
+            )
+        ),
         "result_dir": str(results_dir),
     }
     params_path.write_text(json.dumps(params, indent=2), encoding="utf-8")
